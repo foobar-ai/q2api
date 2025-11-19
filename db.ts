@@ -21,9 +21,13 @@ export async function listAccounts(onlyEnabled: boolean = false): Promise<Accoun
     return accounts.sort((a, b) => b.created_at.localeCompare(a.created_at));
 }
 
+function getTimestamp(): string {
+    return new Date().toISOString().slice(0, 19); // YYYY-MM-DDTHH:MM:SS in UTC
+}
+
 export async function createAccount(data: AccountCreate & { id?: string }): Promise<Account> {
     const id = data.id || crypto.randomUUID();
-    const now = new Date().toISOString().slice(0, 19); // YYYY-MM-DDTHH:MM:SS
+    const now = getTimestamp();
     
     const account: Account = {
         id,
@@ -50,7 +54,7 @@ export async function updateAccount(id: string, data: AccountUpdate): Promise<Ac
     const current = await getAccount(id);
     if (!current) return null;
 
-    const now = new Date().toISOString().slice(0, 19);
+    const now = getTimestamp();
     const updated: Account = { ...current, updated_at: now };
 
     if (data.label !== undefined) updated.label = data.label;
@@ -76,7 +80,7 @@ export async function updateAccountTokens(id: string, accessToken: string, refre
     const current = await getAccount(id);
     if (!current) return;
     
-    const now = new Date().toISOString().slice(0, 19);
+    const now = getTimestamp();
     current.accessToken = accessToken;
     if (refreshToken) current.refreshToken = refreshToken;
     current.last_refresh_time = now;
@@ -90,7 +94,7 @@ export async function updateAccountStats(id: string, success: boolean, maxErrorC
     const current = await getAccount(id);
     if (!current) return;
     
-    const now = new Date().toISOString().slice(0, 19);
+    const now = getTimestamp();
     current.updated_at = now;
     
     if (success) {
@@ -109,7 +113,7 @@ export async function updateAccountRefreshStatus(id: string, status: string): Pr
     const current = await getAccount(id);
     if (!current) return;
     
-    const now = new Date().toISOString().slice(0, 19);
+    const now = getTimestamp();
     current.last_refresh_time = now;
     current.last_refresh_status = status;
     current.updated_at = now;

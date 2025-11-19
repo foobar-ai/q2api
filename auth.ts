@@ -70,7 +70,7 @@ export async function pollTokenDeviceCode(
 
     const now = Date.now() / 1000;
     const upstreamDeadline = now + Math.max(1, expiresIn);
-    const capDeadline = now + (maxTimeoutSec > 0 ? maxTimeoutSec : 0);
+    const capDeadline = maxTimeoutSec > 0 ? now + maxTimeoutSec : upstreamDeadline;
     const deadline = Math.min(upstreamDeadline, capDeadline);
     
     const pollInterval = Math.max(1, interval || 1) * 1000; // ms

@@ -12,27 +12,7 @@ const STREAMING_REQUEST_TEMPLATE = [
         "amz-sdk-request": "attempt=1; max=3",
         "amz-sdk-invocation-id": "681342c1-d020-409c-ab1d-49fe35142d15"
     },
-    {
-        "conversationState": {
-            "conversationId": "7a8a8822-f5ea-4429-b39e-8bdd84e044dd",
-            "history": [],
-            "currentMessage": {
-                "userInputMessage": {
-                    "content": "",
-                    "userInputMessageContext": {
-                        "envState": {
-                            "operatingSystem": "windows",
-                            "currentWorkingDirectory": "C:\\Users\\admin"
-                        },
-                        "tools": []
-                    },
-                    "origin": "CLI",
-                    "modelId": "claude-sonnet-4"
-                }
-            },
-            "chatTriggerType": "MANUAL"
-        }
-    }
+    {} // Empty body template, will be replaced by rawPayload
 ];
 
 export async function sendChatRequest(

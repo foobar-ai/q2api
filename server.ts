@@ -29,6 +29,53 @@ const CONSOLE_ENABLED = (Deno.env.get("ENABLE_CONSOLE") || "true").toLowerCase()
 
 // --- Helpers ---
 
+function extractTextFromEvent(payload: any): string {
+  if (!payload || typeof payload !== 'object') return "";
+  
+  // 1. Check nested content in specific keys
+  const keysToCheck = ["assistantResponseEvent", "assistantMessage", "message", "delta", "data"];
+  for (const key of keysToCheck) {
+    if (payload[key] && typeof payload[key] === 'object') {
+      const inner = payload[key];
+      if (inner.content && typeof inner.content === 'string') {
+        return inner.content;
+      }
+    }
+  }
+
+  // 2. Check top-level content (string)
+  if (payload.content && typeof payload.content === 'string') {
+    return payload.content;
+  }
+
+  // 3. Check lists (chunks or content)
+  const listKeys = ["chunks", "content"];
+  for (const listKey of listKeys) {
+    if (Array.isArray(payload[listKey])) {
+      const parts = payload[listKey].map((item: any) => {
+        if (typeof item === 'string') return item;
+        if (typeof item === 'object') {
+          if (item.content && typeof item.content === 'string') return item.content;
+          if (item.text && typeof item.text === 'string') return item.text;
+        }
+        return "";
+      });
+      const joined = parts.join("");
+      if (joined) return joined;
+    }
+  }
+  
+  // 4. Fallback: check text/delta/payload keys if they are strings
+  const fallbackKeys = ["text", "delta", "payload"];
+  for (const k of fallbackKeys) {
+    if (payload[k] && typeof payload[k] === 'string') {
+      return payload[k];
+    }
+  }
+  
+  return "";
+}
+
 async function refreshAccessTokenInDb(accountId: string): Promise<Account> {
   const acc = await db.getAccount(accountId);
   if (!acc) throw new Error("Account not found");
@@ -307,38 +354,113 @@ app.post("/v1/messages", async (c) => {
     try {
         let result = await getStream(account);
         
-        const stream = new ReadableStream({
-            async start(controller) {
-                const handler = new ClaudeStreamHandler(req.model, 0);
-                const encoder = new TextEncoder();
-                
-                try {
-                    for await (const [eventType, payload] of result.eventStream) {
-                        for await (const sse of handler.handleEvent(eventType, payload)) {
+        if (req.stream) {
+            const stream = new ReadableStream({
+                async start(controller) {
+                    const handler = new ClaudeStreamHandler(req.model, 0);
+                    const encoder = new TextEncoder();
+                    
+                    try {
+                        for await (const [eventType, payload] of result.eventStream) {
+                            for await (const sse of handler.handleEvent(eventType, payload)) {
+                                controller.enqueue(encoder.encode(sse));
+                            }
+                        }
+                        for await (const sse of handler.finish()) {
                             controller.enqueue(encoder.encode(sse));
                         }
+                        await db.updateAccountStats(account.id, true, MAX_ERROR_COUNT);
+                    } catch (e) {
+                        await db.updateAccountStats(account.id, false, MAX_ERROR_COUNT);
+                        console.error("Stream error:", e);
+                        controller.error(e);
+                    } finally {
+                        controller.close();
                     }
-                    for await (const sse of handler.finish()) {
-                        controller.enqueue(encoder.encode(sse));
-                    }
-                    await db.updateAccountStats(account.id, true, MAX_ERROR_COUNT);
-                } catch (e) {
-                    await db.updateAccountStats(account.id, false, MAX_ERROR_COUNT);
-                    console.error("Stream error:", e);
-                    controller.error(e);
-                } finally {
-                    controller.close();
                 }
-            }
-        });
+            });
 
-        return new Response(stream, {
-            headers: {
-                "Content-Type": "text/event-stream",
-                "Cache-Control": "no-cache",
-                "Connection": "keep-alive"
+            return new Response(stream, {
+                headers: {
+                    "Content-Type": "text/event-stream",
+                    "Cache-Control": "no-cache",
+                    "Connection": "keep-alive"
+                }
+            });
+        } else {
+            // Non-streaming: accumulate response
+            const handler = new ClaudeStreamHandler(req.model, 0);
+            const contentBlocks: any[] = [];
+            let usage = { input_tokens: 0, output_tokens: 0 };
+            let stopReason = null;
+            
+            try {
+                for await (const [eventType, payload] of result.eventStream) {
+                    for await (const sse of handler.handleEvent(eventType, payload)) {
+                        if (sse.startsWith("event: ")) {
+                            const lines = sse.split("\n");
+                            const dataLine = lines.find(l => l.startsWith("data: "));
+                            if (dataLine) {
+                                const data = JSON.parse(dataLine.substring(6));
+                                const dtype = data.type;
+                                if (dtype === "content_block_start") {
+                                    const idx = data.index;
+                                    while (contentBlocks.length <= idx) contentBlocks.push(null);
+                                    contentBlocks[idx] = data.content_block;
+                                } else if (dtype === "content_block_delta") {
+                                    const idx = data.index;
+                                    const delta = data.delta;
+                                    if (contentBlocks[idx]) {
+                                        if (delta.type === "text_delta") {
+                                            contentBlocks[idx].text = (contentBlocks[idx].text || "") + delta.text;
+                                        } else if (delta.type === "input_json_delta") {
+                                            contentBlocks[idx].partial_json = (contentBlocks[idx].partial_json || "") + delta.partial_json;
+                                        }
+                                    }
+                                } else if (dtype === "content_block_stop") {
+                                    const idx = data.index;
+                                    if (contentBlocks[idx]?.type === "tool_use" && contentBlocks[idx].partial_json) {
+                                        try {
+                                            contentBlocks[idx].input = JSON.parse(contentBlocks[idx].partial_json);
+                                            delete contentBlocks[idx].partial_json;
+                                        } catch {}
+                                    }
+                                } else if (dtype === "message_delta") {
+                                    usage = data.usage || usage;
+                                    stopReason = data.delta?.stop_reason;
+                                }
+                            }
+                        }
+                    }
+                }
+                for await (const sse of handler.finish()) {
+                    if (sse.startsWith("event: message_delta")) {
+                        const lines = sse.split("\n");
+                        const dataLine = lines.find(l => l.startsWith("data: "));
+                        if (dataLine) {
+                            const data = JSON.parse(dataLine.substring(6));
+                            usage = data.usage || usage;
+                            stopReason = data.delta?.stop_reason;
+                        }
+                    }
+                }
+                await db.updateAccountStats(account.id, true, MAX_ERROR_COUNT);
+            } catch (e) {
+                await db.updateAccountStats(account.id, false, MAX_ERROR_COUNT);
+                throw e;
             }
-        });
+            
+            return c.json({
+                id: `msg_${crypto.randomUUID()}`,
+                type: "message",
+                role: "assistant",
+                model: req.model,
+                content: contentBlocks.filter(b => b !== null),
+                stop_reason: stopReason,
+                stop_sequence: null,
+                usage: usage
+            });
+        }
 
     } catch (e: any) {
         await db.updateAccountStats(account.id, false, MAX_ERROR_COUNT);
@@ -394,67 +516,7 @@ app.post("/v1/chat/completions", async (c) => {
                         });
 
                         for await (const [eventType, payload] of result.eventStream) {
-                            if (CONSOLE_ENABLED) {
-                                // console.log("Event Type:", eventType);
-                                // console.log("Payload keys:", typeof payload === 'object' ? Object.keys(payload) : "primitive");
-                            }
-
-                            // We need to extract text from Amazon Q events
-                            // Enhanced logic matching Python's _extract_text_from_event fully
-                            let text = "";
-                            
-                            if (payload && typeof payload === 'object') {
-                                // 1. Check nested content in specific keys
-                                const keysToCheck = ["assistantResponseEvent", "assistantMessage", "message", "delta", "data"];
-                                for (const key of keysToCheck) {
-                                    if (payload[key] && typeof payload[key] === 'object') {
-                                        const inner = payload[key];
-                                        if (inner.content && typeof inner.content === 'string') {
-                                            text = inner.content;
-                                            break;
-                                        }
-                                    }
-                                }
-
-                                // 2. Check top-level content (string)
-                                if (!text && payload.content && typeof payload.content === 'string') {
-                                    text = payload.content;
-                                }
-
-                                // 3. Check lists (chunks or content)
-                                if (!text) {
-                                    const listKeys = ["chunks", "content"];
-                                    for (const listKey of listKeys) {
-                                        if (Array.isArray(payload[listKey])) {
-                                            const parts = payload[listKey].map((item: any) => {
-                                                if (typeof item === 'string') return item;
-                                                if (typeof item === 'object') {
-                                                    if (item.content && typeof item.content === 'string') return item.content;
-                                                    if (item.text && typeof item.text === 'string') return item.text;
-                                                }
-                                                return "";
-                                            });
-                                            const joined = parts.join("");
-                                            if (joined) {
-                                                text = joined;
-                                                break;
-                                            }
-                                        }
-                                    }
-                                }
-                                
-                                // 4. Fallback: check text/delta/payload keys if they are strings
-                                if (!text) {
-                                    const fallbackKeys = ["text", "delta", "payload"];
-                                    for (const k of fallbackKeys) {
-                                        if (payload[k] && typeof payload[k] === 'string') {
-                                            text = payload[k];
-                                            break;
-                                        }
-                                    }
-                                }
-                            }
-                            
+                            const text = extractTextFromEvent(payload);
                             if (text) {
                                 sendSSE({
                                     id, object: "chat.completion.chunk", created, model,
@@ -488,57 +550,7 @@ app.post("/v1/chat/completions", async (c) => {
             // Non-streaming: accumulate
             const chunks: string[] = [];
             for await (const [_, payload] of result.eventStream) {
-                let text = "";
-                
-                if (payload && typeof payload === 'object') {
-                    // 1. Check nested content
-                    const keysToCheck = ["assistantResponseEvent", "assistantMessage", "message", "delta", "data"];
-                    for (const key of keysToCheck) {
-                        if (payload[key] && typeof payload[key] === 'object') {
-                            const inner = payload[key];
-                            if (inner.content && typeof inner.content === 'string') {
-                                text = inner.content;
-                                break;
-                            }
-                        }
-                    }
-
-                    // 2. Check top-level content
-                    if (!text && payload.content && typeof payload.content === 'string') {
-                        text = payload.content;
-                    }
-
-                    // 3. Check lists
-                    if (!text) {
-                        const listKeys = ["chunks", "content"];
-                        for (const listKey of listKeys) {
-                            if (Array.isArray(payload[listKey])) {
-                                const parts = payload[listKey].map((item: any) => {
-                                    if (typeof item === 'string') return item;
-                                    if (typeof item === 'object') {
-                                        if (item.content && typeof item.content === 'string') return item.content;
-                                        if (item.text && typeof item.text === 'string') return item.text;
-                                    }
-                                    return "";
-                                });
-                                text = parts.join("");
-                                if (text) break;
-                            }
-                        }
-                    }
-                    
-                    // 4. Fallback
-                    if (!text) {
-                        const fallbackKeys = ["text", "delta", "payload"];
-                        for (const k of fallbackKeys) {
-                            if (payload[k] && typeof payload[k] === 'string') {
-                                text = payload[k];
-                                break;
-                            }
-                        }
-                    }
-                }
-
+                const text = extractTextFromEvent(payload);
                 if (text) chunks.push(text);
             }
             
