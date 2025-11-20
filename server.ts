@@ -24,8 +24,67 @@ const ALLOWED_API_KEYS = (Deno.env.get("OPENAI_KEYS") || "")
   .map(k => k.trim())
   .filter(k => k);
 
+const WEB_PASSWORD = Deno.env.get("WEB_PASSWORD");
 const MAX_ERROR_COUNT = parseInt(Deno.env.get("MAX_ERROR_COUNT") || "100");
 const CONSOLE_ENABLED = (Deno.env.get("ENABLE_CONSOLE") || "true").toLowerCase() !== "false";
+
+// Session storage for web login
+const WEB_SESSIONS = new Map<string, { expires: number }>();
+
+// --- Web Auth Helpers ---
+function generateSessionToken(): string {
+  return crypto.randomUUID();
+}
+
+function createSession(): { token: string; expires: number } {
+  const token = generateSessionToken();
+  const expires = Date.now() + (24 * 60 * 60 * 1000); // 24 hours
+  WEB_SESSIONS.set(token, { expires });
+  return { token, expires };
+}
+
+function validateSession(token: string): boolean {
+  const session = WEB_SESSIONS.get(token);
+  if (!session) return false;
+  if (Date.now() > session.expires) {
+    WEB_SESSIONS.delete(token);
+    return false;
+  }
+  return true;
+}
+
+function cleanupExpiredSessions() {
+  const now = Date.now();
+  for (const [token, session] of WEB_SESSIONS.entries()) {
+    if (now > session.expires) {
+      WEB_SESSIONS.delete(token);
+    }
+  }
+}
+
+// Cleanup expired sessions every hour
+Deno.cron("Cleanup Sessions", "0 * * * *", cleanupExpiredSessions);
+
+// --- Web Auth Middleware ---
+function requireWebAuth(c: any, next: any) {
+  // If no web password is set, allow access
+  if (!WEB_PASSWORD) {
+    return next();
+  }
+
+  const sessionToken = c.req.header("Cookie")?.match(/session=([^;]+)/)?.[1];
+  
+  if (!sessionToken || !validateSession(sessionToken)) {
+    // Redirect to login page or return unauthorized for API calls
+    if (c.req.path.startsWith("/api/")) {
+      return c.json({ error: "Unauthorized" }, 401);
+    } else {
+      return c.redirect("/login");
+    }
+  }
+  
+  return next();
+}
 
 // --- Helpers ---
 
@@ -206,8 +265,48 @@ Deno.cron("Refresh Tokens", "*/5 * * * *", refreshStaleTokens);
 
 app.get("/healthz", (c) => c.json({ status: "ok" }));
 
-// Frontend
-app.get("/", serveStatic({ path: "./frontend/index.html" }));
+// Login page
+app.get("/login", serveStatic({ path: "./frontend/login.html" }));
+
+// Login API
+app.post("/api/login", async (c) => {
+  if (!WEB_PASSWORD) {
+    return c.json({ error: "Web password not configured" }, 500);
+  }
+
+  const body = await c.req.json();
+  const { password } = body;
+
+  if (password === WEB_PASSWORD) {
+    const { token } = createSession();
+    return c.json({ success: true, token });
+  } else {
+    return c.json({ error: "Invalid password" }, 401);
+  }
+});
+
+// Logout API
+app.post("/api/logout", async (c) => {
+  const sessionToken = c.req.header("Cookie")?.match(/session=([^;]+)/)?.[1];
+  if (sessionToken) {
+    WEB_SESSIONS.delete(sessionToken);
+  }
+  return c.json({ success: true });
+});
+
+// Frontend with auth protection
+app.get("/", (c) => {
+  return requireWebAuth(c, () => {
+    return serveStatic({ path: "./frontend/index.html" })(c);
+  });
+});
+
+// Protect all frontend routes
+app.get("/frontend/*", (c) => {
+  return requireWebAuth(c, () => {
+    return serveStatic({ path: "./frontend" })(c);
+  });
+});
 
 // Account Management
 if (CONSOLE_ENABLED) {

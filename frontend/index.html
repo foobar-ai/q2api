@@ -199,7 +199,10 @@
 </head>
 <body>
   <div class="container">
-    <h1>v2 前端控制台</h1>
+    <div class="row" style="justify-content: space-between; align-items: center;">
+      <h1>v2 前端控制台</h1>
+      <button class="btn-secondary btn-sm" onclick="logout()">退出登录</button>
+    </div>
 
     <div class="tabs">
       <button class="tab active" onclick="switchTab('accounts')">账号管理</button>
@@ -519,6 +522,18 @@ async function send() {
       out.textContent += decoder.decode(value, {stream:true});
     }
   }
+}
+
+async function logout() {
+  try {
+    await fetch('/api/logout', { method: 'POST' });
+  } catch (e) {
+    console.error('Logout error:', e);
+  }
+  
+  // Clear session cookie and redirect to login
+  document.cookie = 'session=; path=/; expires=Thu, 01 Jan 1970 00:00:01 GMT';
+  window.location.href = '/login';
 }
 
 window.addEventListener('DOMContentLoaded', () => {
